@@ -47,10 +47,11 @@ type Bucket struct {
 }
 
 const (
-	alert_threshold  = 400             // average to go over to trigger alert
-	alert_average_by = 60              // average over 60 buckets (60 * 2sec interval = 2min)
-	flush_interval   = 2 * time.Second // interval to aggregate and flush, aka bucket size
-	average_by       = 30              // number of buckets to average by (30 * 2sec interval = 1min)
+	alert_threshold          = 400             // average to go over to trigger alert
+	alert_average_by         = 60              // average over 60 buckets (60 * 2sec interval = 2min)
+	flush_interval           = 2 * time.Second // interval to aggregate and flush, aka bucket size
+	average_by               = 30              // number of buckets to average by (30 * 2sec interval = 1min)
+	update_logdump_frequency = 500             // how often to update the logdump view in ms
 )
 
 var (
@@ -65,9 +66,13 @@ var (
 	maxX             int
 	maxY             int
 	t                TimeSeries
+	main_output      chan string
 	status_output    chan string
 	sparks_output    chan string
 	averages_output  chan string
+	logdump_output   chan string
+	alerts_output    chan string
+	rawlog_output    chan RawLogEvent
 )
 
 type TimeSeries []*Bucket
@@ -134,26 +139,26 @@ func main() {
 		log.Panicln(err)
 	}
 
-	rawlog_output := make(chan RawLogEvent)
-	main_output := make(chan string)
-	logdump_output := make(chan string)
-	alerts_output := make(chan string)
-	alert_state_chan = make(chan bool)
-	status_output = make(chan string)
-	sparks_output = make(chan string)
+	rawlog_output = make(chan RawLogEvent)
+	alerts_output = make(chan string)
 	averages_output = make(chan string)
+	logdump_output = make(chan string)
+	main_output = make(chan string)
+	sparks_output = make(chan string)
+	status_output = make(chan string)
+	alert_state_chan = make(chan bool)
 
 	t = make([]*Bucket, 0)
 
 	go updateTimeView(g)
-	go updateMainView(g, main_output)
-	go updateLogDumpView(g, logdump_output)
-	go updateAlertsView(g, alerts_output, alert_state_chan)
-	go updateStatusView(g, status_output)
-	go updateSparksView(g, sparks_output)
-	go updateAveragesView(g, averages_output)
-	go readLog(rawlog_output, logdump_output)
-	go bucketize(rawlog_output, main_output, alerts_output)
+	go updateMainView(g)
+	go updateLogDumpView(g)
+	go updateAlertsView(g)
+	go updateStatusView(g)
+	go updateSparksView(g)
+	go updateAveragesView(g)
+	go readLog()
+	go bucketize()
 
 	err := g.MainLoop()
 	if err != nil && err != gocui.Quit {
@@ -162,30 +167,39 @@ func main() {
 
 }
 
-func bucketize(rawlog_output chan RawLogEvent, main_output, alerts_output chan string) {
+func bucketize() {
 	events := make([]*RawLogEvent, 0)
 	flush := time.Tick(flush_interval)
 	alert_fail_state := false
 
 	for {
 		select {
+
+		// append incoming RawLogEvent to events[]
 		case event := <-rawlog_output:
 			events = append(events, &event)
+
 		case <-flush:
+			// take all the log lines since the last flush,
+			// generate stats, puts results in a bucket,
+			// append the bucket to a slice,
+			// fire off stats reporting to the UI
+			// fire off an alert check/ui update
 			_ip := make(map[string]int)
-			ip := make([]Counter, 0)
-			timestamp := time.Now().Local()
-			_section := make(map[string]int)
-			section := make([]Counter, 0)
-			_status := make(map[string]int)
-			status := make([]Counter, 0)
-			var bytes int64 = 0
 			_referer := make(map[string]int)
-			referer := make([]Counter, 0)
+			_section := make(map[string]int)
+			_status := make(map[string]int)
 			_useragent := make(map[string]int)
+			ip := make([]Counter, 0)
+			referer := make([]Counter, 0)
+			section := make([]Counter, 0)
+			status := make([]Counter, 0)
 			useragent := make([]Counter, 0)
+			timestamp := time.Now().Local()
+			var bytes int64 = 0
 			var hits int = 0
 
+			// roll up, aggregate, average out
 			for _, event := range events {
 				_ip[event.ip]++
 				path := strings.Split(event.query, "/")[1]
@@ -197,9 +211,15 @@ func bucketize(rawlog_output chan RawLogEvent, main_output, alerts_output chan s
 				hits++
 			}
 
+			// empty the events slice
 			events = events[0:0]
 
-			// refactor these ..
+			// ugh this needs refactoring, and is totally stupid. a result of learning go
+			// while writing this code.. I used maps to count uniques and then learned that
+			// you can't sort them, but you can implement a sortable struct that's exactly
+			// like a map. (Or maybe you can use the sortable primitives on a type that is
+			// a map and I'm just a go nub).. this just copies the maps into Counters and
+			// sorts them, ideally, we could get rid of the maps just use Counter directly
 			for k, v := range _ip {
 				counter := Counter{k, v}
 				ip = append(ip, counter)
@@ -226,11 +246,15 @@ func bucketize(rawlog_output chan RawLogEvent, main_output, alerts_output chan s
 				sort.Sort(ByCount(useragent))
 			}
 
+			// put it in a bucket
 			bucket := Bucket{ip, timestamp, section, status, bytes, referer, useragent, hits}
+
+			// put the bucket in the time series slice
 			t = append(t, &bucket)
 
+			// draw stats
 			go func() {
-				// this should really be refactored into methods of TimeSeries
+				// this should be refactored into TimeSeries methods
 				sparkline_width := int(math.Abs(math.Min(float64(len(t)-1), float64(maxX-38))))
 				sparkline_start := len(t) - sparkline_width
 				top_sections := int(math.Abs(math.Min(float64(len(t[len(t)-1].section)), float64(maxY-17))))
@@ -286,7 +310,9 @@ func bucketize(rawlog_output chan RawLogEvent, main_output, alerts_output chan s
 	}
 }
 
-func updateStatusView(g *gocui.Gui, status_output chan string) {
+// https://www.youtube.com/watch?v=73MQRYLeyWc tl;dw too much flush
+
+func updateStatusView(g *gocui.Gui) {
 	status_view, _ := g.View("status")
 	for i := range status_output {
 		status_view.Clear()
@@ -295,7 +321,7 @@ func updateStatusView(g *gocui.Gui, status_output chan string) {
 	}
 }
 
-func updateSparksView(g *gocui.Gui, sparks_output chan string) {
+func updateSparksView(g *gocui.Gui) {
 	sparks_view, _ := g.View("sparks")
 	for i := range sparks_output {
 		sparks_view.Clear()
@@ -304,7 +330,7 @@ func updateSparksView(g *gocui.Gui, sparks_output chan string) {
 	}
 }
 
-func updateAveragesView(g *gocui.Gui, averages_output chan string) {
+func updateAveragesView(g *gocui.Gui) {
 	averages_view, _ := g.View("averages")
 	for i := range averages_output {
 		averages_view.Clear()
@@ -325,7 +351,7 @@ func updateTimeView(g *gocui.Gui) {
 	}
 }
 
-func updateMainView(g *gocui.Gui, main_output chan string) {
+func updateMainView(g *gocui.Gui) {
 	main_view, _ := g.View("main")
 	for i := range main_output {
 		main_view.Clear()
@@ -334,9 +360,9 @@ func updateMainView(g *gocui.Gui, main_output chan string) {
 	}
 }
 
-func updateLogDumpView(g *gocui.Gui, logdump_output chan string) {
+func updateLogDumpView(g *gocui.Gui) {
 	logdump_view, _ := g.View("logdump_view")
-	flush := time.Tick(2 * time.Second)
+	flush := time.Tick(update_logdump_frequency * time.Millisecond)
 	for {
 		select {
 		case log_data := <-logdump_output:
@@ -347,7 +373,7 @@ func updateLogDumpView(g *gocui.Gui, logdump_output chan string) {
 	}
 }
 
-func updateAlertsView(g *gocui.Gui, alerts_output chan string, alert_state_chan chan bool) {
+func updateAlertsView(g *gocui.Gui) {
 	alerts_view, _ := g.View("alerts")
 	for {
 		select {
@@ -365,7 +391,7 @@ func updateAlertsView(g *gocui.Gui, alerts_output chan string, alert_state_chan 
 	}
 }
 
-func readLog(c chan RawLogEvent, logdump_output chan string) {
+func readLog() {
 	var seek = tail.SeekInfo{Offset: 0, Whence: 2}
 	tailer, err := tail.TailFile(os.Args[1], tail.Config{
 		Follow:   true,
@@ -375,7 +401,9 @@ func readLog(c chan RawLogEvent, logdump_output chan string) {
 	if err != nil {
 		log.Panicln(err)
 	}
+
 	re := regexp.MustCompile(`^(?P<ip>[\d\.]+) - - \[(?P<time>.*)\] "(?P<verb>.*) (?P<query>.*) (?P<proto>.*)" (?P<status>\d+) (?P<bytes>\d+) "(?P<referer>.*)" "(?P<useragent>.*)"`)
+
 	for line := range tailer.Lines {
 		res := re.FindStringSubmatch(line.Text)
 		ip := res[1]
@@ -390,14 +418,14 @@ func readLog(c chan RawLogEvent, logdump_output chan string) {
 
 		logline := RawLogEvent{ip, curtime, verb, query, proto, status, bytes, referer, useragent}
 
-		c <- logline
-		logdump_output <- res[0]
+		rawlog_output <- logline
+		logdump_output <- res[0] // Spraynard Kruger
 	}
 }
 
 func layout(g *gocui.Gui) error {
 	maxX, maxY = g.Size()
-	if main_view, err := g.SetView("main", -1, 6, maxX, maxY-16); err != nil &&
+	if main_view, err := g.SetView("main", 0, 5, maxX-1, maxY-15); err != nil &&
 		err != gocui.ErrorUnkView {
 		return err
 	} else {
@@ -405,7 +433,7 @@ func layout(g *gocui.Gui) error {
 		main_view.Frame = false
 	}
 
-	if status_view, err := g.SetView("status", 0, 3, 26, 6); err != nil &&
+	if status_view, err := g.SetView("status", 0, 2, 26, 5); err != nil &&
 		err != gocui.ErrorUnkView {
 		return err
 	} else {
@@ -413,7 +441,7 @@ func layout(g *gocui.Gui) error {
 		status_view.FgColor = gocui.ColorGreen
 	}
 
-	if sparks_view, err := g.SetView("sparks", 26, 3, maxX-1, 6); err != nil &&
+	if sparks_view, err := g.SetView("sparks", 26, 2, maxX-1, 5); err != nil &&
 		err != gocui.ErrorUnkView {
 		return err
 	} else {
@@ -436,7 +464,7 @@ func layout(g *gocui.Gui) error {
 		time_view.Frame = true
 	}
 
-	if logdump_view, err := g.SetView("logdump_view", 0, maxY-16, maxX-1, maxY-8); err != nil &&
+	if logdump_view, err := g.SetView("logdump_view", 0, maxY-15, maxX-1, maxY-7); err != nil &&
 		err != gocui.ErrorUnkView {
 		return err
 	} else {
