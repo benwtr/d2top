@@ -37,7 +37,7 @@ type RawLogEvent struct {
 
 type Bucket struct {
 	ip        []Counter
-	time      time.Time
+	timestamp time.Time
 	section   []Counter
 	status    []Counter
 	bytes     int64
@@ -62,10 +62,11 @@ var (
 	averages_view    *gocui.View
 	logdump_view     *gocui.View
 	alerts_view      *gocui.View
+	alert_fail_state bool = false
 	alert_state_chan chan bool
 	maxX             int
 	maxY             int
-	t                TimeSeries
+	ts               TimeSeries
 	main_output      chan string
 	status_output    chan string
 	sparks_output    chan string
@@ -148,7 +149,7 @@ func main() {
 	status_output = make(chan string)
 	alert_state_chan = make(chan bool)
 
-	t = make([]*Bucket, 0)
+	ts = make([]*Bucket, 0)
 
 	go updateTimeView(g)
 	go updateMainView(g)
@@ -170,7 +171,6 @@ func main() {
 func bucketize() {
 	events := make([]*RawLogEvent, 0)
 	flush := time.Tick(flush_interval)
-	alert_fail_state := false
 
 	for {
 		select {
@@ -250,68 +250,70 @@ func bucketize() {
 			bucket := Bucket{ip, timestamp, section, status, bytes, referer, useragent, hits}
 
 			// put the bucket in the time series slice
-			t = append(t, &bucket)
+			ts = append(ts, &bucket)
 
 			// draw stats
 			go func() {
 				// this should be refactored into TimeSeries methods
-				sparkline_width := int(math.Abs(math.Min(float64(len(t)-1), float64(maxX-38))))
-				sparkline_start := len(t) - sparkline_width
-				top_sections := int(math.Abs(math.Min(float64(len(t[len(t)-1].section)), float64(maxY-17))))
+				sparkline_width := int(math.Abs(math.Min(float64(len(ts)-1), float64(maxX-38))))
+				sparkline_start := len(ts) - sparkline_width
+				top_sections := int(math.Abs(math.Min(float64(len(ts[len(ts)-1].section)), float64(maxY-17))))
 
 				averages_message := ""
-				averages_message += fmt.Sprint(" avg hits: ", t.AverageHits(average_by))
-				averages_message += fmt.Sprint("   avg bytes: ", t.AverageBytes(average_by))
+				averages_message += fmt.Sprint(" avg hits: ", ts.AverageHits(average_by))
+				averages_message += fmt.Sprint("   avg bytes: ", ts.AverageBytes(average_by))
 				averages_output <- averages_message
 
 				status_message := ""
-				status_message += fmt.Sprintln(" total hits:  ", t.TotalHits())
-				status_message += fmt.Sprintln(" total bytes: ", t.TotalBytes())
+				status_message += fmt.Sprintln(" total hits:  ", ts.TotalHits())
+				status_message += fmt.Sprintln(" total bytes: ", ts.TotalBytes())
 				status_output <- status_message
 
 				sparks_message := " "
 				hits_history := make([]float64, 0)
 				bytes_history := make([]float64, 0)
-				for _, b := range t[sparkline_start:] {
+				for _, b := range ts[sparkline_start:] {
 					hits_history = append(hits_history, float64(b.hits))
 					bytes_history = append(bytes_history, float64(b.bytes))
 				}
 				sparks_message += spark.Line(hits_history)
-				sparks_message += fmt.Sprint(" ", t.LastBucket().hits, "\n ")
+				sparks_message += fmt.Sprint(" ", ts.LastBucket().hits, "\n ")
 				sparks_message += spark.Line(bytes_history)
-				sparks_message += fmt.Sprint(" ", t.LastBucket().bytes, "\n ")
+				sparks_message += fmt.Sprint(" ", ts.LastBucket().bytes, "\n ")
 				sparks_output <- sparks_message
 
 				message := ""
-				for _, v := range t.LastBucket().section[:top_sections] {
+				for _, v := range ts.LastBucket().section[:top_sections] {
 					message += fmt.Sprint(" /", v.name, " : ", strconv.Itoa(v.count), "\n")
 				}
 				main_output <- message
 			}()
 
 			// alert on crossing threshold
-			go func() {
-				avg := t.AverageHits(alert_average_by)
-				if avg > alert_threshold && !alert_fail_state {
-					alert_fail_state = true
-					alert_state_chan <- alert_fail_state
-					message := []string{"avg hits- ", strconv.Itoa(avg), " in last 2m exceeded alert_threshold of ", strconv.Itoa(alert_threshold), " at ", time.Now().Local().String()}
-					alerts_output <- strings.Join(message, "")
-				}
-				if avg < alert_threshold && alert_fail_state {
-					alert_fail_state = false
-					alert_state_chan <- alert_fail_state
-					message := []string{"avg hits- ", strconv.Itoa(avg), " in last 2m below alert_threshold of ", strconv.Itoa(alert_threshold), " at ", time.Now().Local().String()}
-					alerts_output <- strings.Join(message, "")
-				}
-			}()
-
+			go MonitorHits()
 		}
 	}
 }
 
-// https://www.youtube.com/watch?v=73MQRYLeyWc tl;dw too much flush
+func MonitorHits() {
+	avg := ts.AverageHits(alert_average_by)
+	if avg > alert_threshold && !alert_fail_state {
+		alert_fail_state = true
+		message := []string{"avg hits- ", strconv.Itoa(avg), " in last 2m exceeded alert_threshold of ", strconv.Itoa(alert_threshold), " at ", time.Now().Local().String()}
+		alerts_output <- strings.Join(message, "")
+		alert_state_chan <- alert_fail_state
+	}
+	if avg < alert_threshold && alert_fail_state {
+		alert_fail_state = false
+		message := []string{"avg hits- ", strconv.Itoa(avg), " in last 2m below alert_threshold of ", strconv.Itoa(alert_threshold), " at ", time.Now().Local().String()}
+		alerts_output <- strings.Join(message, "")
+		alert_state_chan <- alert_fail_state
+	}
+}
 
+// the UI could be a lot smoother if there was less Clear()
+// and Flush() .. Flush() could run on an interval instead of
+// inside these update*View functions
 func updateStatusView(g *gocui.Gui) {
 	status_view, _ := g.View("status")
 	for i := range status_output {
@@ -402,7 +404,7 @@ func readLog() {
 		log.Panicln(err)
 	}
 
-	re := regexp.MustCompile(`^(?P<ip>[\d\.]+) - - \[(?P<time>.*)\] "(?P<verb>.*) (?P<query>.*) (?P<proto>.*)" (?P<status>\d+) (?P<bytes>\d+) "(?P<referer>.*)" "(?P<useragent>.*)"`)
+	re := regexp.MustCompile(`^(?P<ip>[\d\.]+) - - \[(?P<timestamp>.*)\] "(?P<verb>.*) (?P<query>.*) (?P<proto>.*)" (?P<status>\d+) (?P<bytes>\d+) "(?P<referer>.*)" "(?P<useragent>.*)"`)
 
 	for line := range tailer.Lines {
 		res := re.FindStringSubmatch(line.Text)
