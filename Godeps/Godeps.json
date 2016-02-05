@@ -1,0 +1,39 @@
+{
+	"ImportPath": "github.com/benwtr/d2top",
+	"GoVersion": "go1.5",
+	"Deps": [
+		{
+			"ImportPath": "github.com/hpcloud/tail",
+			"Comment": "v0-15-g05d326f",
+			"Rev": "05d326f7170255d4f0c2a57dd00268b9beeb6e59"
+		},
+		{
+			"ImportPath": "github.com/joliv/spark",
+			"Comment": "v1.0",
+			"Rev": "e0eaf3444d05c395369fcea69986b5b62681328f"
+		},
+		{
+			"ImportPath": "github.com/jroimartin/gocui",
+			"Comment": "v0.1.0-59-ge5bf60e",
+			"Rev": "e5bf60e36b67610cf66ef779ad2b83c317b5ec49"
+		},
+		{
+			"ImportPath": "github.com/mattn/go-runewidth",
+			"Comment": "travisish-37-g12e0ff7",
+			"Rev": "12e0ff74603c9a3209d8bf84f8ab349fe1ad9477"
+		},
+		{
+			"ImportPath": "github.com/nsf/termbox-go",
+			"Rev": "62033d80b58736ea31beaf43348f5147913af30e"
+		},
+		{
+			"ImportPath": "gopkg.in/fsnotify.v0",
+			"Comment": "v0.9.3",
+			"Rev": "ea925a0a47d225b2ca7f9932b01d2ed4f3ec74f6"
+		},
+		{
+			"ImportPath": "gopkg.in/tomb.v1",
+			"Rev": "dd632973f1e7218eb1089048e0798ec9ae7dceb8"
+		}
+	]
+}
